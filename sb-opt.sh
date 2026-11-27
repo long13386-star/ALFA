@@ -35,7 +35,7 @@ else
 red "脚本不支持当前的系统，请选择使用Ubuntu,Debian,Centos系统。" && exit
 fi
 export sbfiles="/etc/s-box/sb10.json /etc/s-box/sb11.json /etc/s-box/sb.json"
-export SB_OPT_VERSION="1.2-20261127"
+export SB_OPT_VERSION="1.3-20261128"
 # sb-opt patch (Muse 2026-11-23): upstream yonggekkk/sing-box-yg sb.sh + speed optimisations.
 # sha256 upstream: 30064ac7b9666753dc0dff3f9f310b622b127975ccd142be1f696530f28d9b14
 # HY_UP_MBPS / HY_DOWN_MBPS: Hysteria2 up / down Mbps, set separately.
@@ -49,6 +49,11 @@ export SB_OPT_VERSION="1.2-20261127"
 # HTTPS only serves clmi.yaml (nginx allows nothing else), so
 # sbox.json / jhsub.txt stay on the HTTP local-IP addresses.
 # Without nginx/cert, output falls back to the HTTP addresses.
+# v1.3: nginx HTTPS subscription is part of the install: opt_https_sub_setup()
+# installs nginx and writes the 10443 vhost (same token, existing cert)
+# when the subscription is created (ipsub) and, if cert+token already
+# exist, at the end of a fresh install. Missing cert/token only skips
+# it with a note, never fails the install.
 export sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
 vsid=$(grep -i version_id /etc/os-release | cut -d \" -f2 | cut -d . -f1)
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -317,6 +322,83 @@ PYEOF
   else
     yellow "nginx 配置检查失败，已恢复备份，请手动检查 $_conf"
     cp -a "$_conf.bak-sbopt" "$_conf" 2>/dev/null
+  fi
+}
+
+opt_https_sub_setup(){
+  # Install nginx + the HTTPS subscription vhost (fleet standard: 10443,
+  # cert /root/ygkkkca/cert.crt, same token as the HTTP subscription).
+  # Called from ipsub() (token guaranteed) and from the install flow
+  # (no-op when cert/token are not there yet). Never fails the caller:
+  # a missing cert/token or a failed nginx install only prints a note.
+  # After writing the vhost, nginx is RESTARTED (not just enabled):
+  # apt already starts nginx once with the default config, so a plain
+  # enable would leave the new vhost unloaded and 10443 unlistened.
+  local _token="" _domain="" _port="" _conf="" _label="" _old=""
+  _token=$(cat /etc/s-box/subtoken.log 2>/dev/null)
+  if [[ -z "$_token" ]]; then yellow "未设置订阅 token，跳过 nginx HTTPS 订阅安装（先用 3→8 设置本地订阅）"; return 0; fi
+  if [[ ! -f /root/ygkkkca/cert.crt || ! -f /root/ygkkkca/private.key ]]; then yellow "未找到 /root/ygkkkca 域名证书，跳过 nginx HTTPS 订阅安装（先用 12 申请证书）"; return 0; fi
+  opt_https_sub
+  if [[ "$HTTPS_SUB_OK" = "1" ]]; then
+    _domain="$HTTPS_SUB_DOMAIN"; _port="$HTTPS_SUB_PORT"
+  else
+    _domain=$(openssl x509 -in /root/ygkkkca/cert.crt -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | cut -d, -f1 | tr -d ' ' | head -n1)
+    _port="${SB_OPT_HTTPS_PORT:-10443}"
+    if [[ -z "$_domain" ]]; then
+      _domain=$(grep -E '^[[:space:]]*server: ' /etc/s-box/clmi.yaml 2>/dev/null | awk '{print $2}' | grep -E '\.' | grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+    fi
+  fi
+  if [[ -z "$_domain" ]]; then yellow "拿不到订阅域名，跳过 nginx HTTPS 订阅安装"; return 0; fi
+  _label="${_domain%%.*}"
+  _conf="/etc/nginx/conf.d/${_label}-sub.conf"
+  if ! command -v nginx >/dev/null 2>&1; then
+    green "正在安装 nginx（HTTPS 订阅用）……"
+    if command -v apk >/dev/null 2>&1; then
+      apk add --no-cache nginx >/dev/null 2>&1 || { yellow "nginx 安装失败，HTTPS 订阅未安装"; return 0; }
+    else
+      apt-get update -qq >/dev/null 2>&1
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1 || { yellow "nginx 安装失败，HTTPS 订阅未安装"; return 0; }
+    fi
+  fi
+  mkdir -p /etc/nginx/conf.d
+  for _old in /etc/nginx/conf.d/*-sub.conf; do
+    [[ -f "$_old" && "$_old" != "$_conf" ]] && grep -q "clmi.yaml" "$_old" 2>/dev/null && rm -f "$_old"
+  done
+  [[ -f "$_conf" ]] && cp -a "$_conf" "$_conf.bak-sbopt" 2>/dev/null
+  cat > "$_conf" <<EOF_NGINX
+server {
+    listen $_port ssl;
+    server_name $_domain;
+    ssl_certificate /root/ygkkkca/cert.crt;
+    ssl_certificate_key /root/ygkkkca/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    location /$_token/clmi.yaml {
+        alias /etc/s-box/clmi.yaml;
+        add_header Cache-Control "no-store";
+    }
+    location / {
+        return 404;
+    }
+}
+EOF_NGINX
+  rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default /etc/nginx/conf.d/default.conf
+  if ! nginx -t >/dev/null 2>&1; then
+    yellow "nginx 配置检查失败，已恢复备份"
+    [[ -f "$_conf.bak-sbopt" ]] && cp -a "$_conf.bak-sbopt" "$_conf"
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable nginx >/dev/null 2>&1
+    systemctl restart nginx
+  else
+    nginx -s reload 2>/dev/null || nginx
+  fi
+  sleep 1
+  if curl -sk -o /dev/null -w "%{http_code}" "https://$_domain:$_port/$_token/clmi.yaml" --resolve "$_domain:$_port:127.0.0.1" 2>/dev/null | grep -q "^200$"; then
+    green "HTTPS订阅已安装：https://$_domain:$_port/$_token/clmi.yaml"
+  else
+    yellow "nginx 已启动，但本地验证 HTTPS 订阅未返回 200，请检查证书和端口 $_port（安全组也要放开 $_port）"
   fi
 }
 # --- end sb-opt helpers -----------------------------------------------------
@@ -2712,6 +2794,7 @@ opt_hy_bw_prompt
 inssbjsonser
 sbservice
 opt_apply_sysctl
+opt_https_sub_setup
 sbactive
 #curl -sL https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/version/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
@@ -3343,6 +3426,7 @@ crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 fi
 opt_https_sub_sync
+opt_https_sub_setup
 sbshare > /dev/null 2>&1
 sleep 1 && green "本地IP订阅链接已更新完成" && sleep 3 && sb
 }
